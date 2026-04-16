@@ -1,5 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
-
 {-
  - Copyright: 2026 Chris Misa
  - License: (See ./LICENSE)
@@ -11,7 +9,6 @@
 module MAAD where
 
 import System.Environment
-import System.Exit
 import System.IO
 import Data.Function ((&))
 import Control.Arrow
@@ -55,13 +52,9 @@ maxQ = 3.5
 qs :: [Double]
 qs = [minQ, minQ+deltaQ..maxQ]
 
-data OutputFormat = OutputCsv | OutputJson
-  deriving (Eq, Show)
-
 data Config = Config
   { cfgFilepath :: String
   , cfgOutPrefix :: String
-  , cfgFormat :: OutputFormat
   , cfgStructure :: Bool
   , cfgSpectrum :: Bool
   , cfgDimensions :: Bool
@@ -74,13 +67,6 @@ data Config = Config
   }
   deriving (Show)
 
-data Metadata = Metadata
-  { metaInput :: String
-  , metaMinPrefixLength :: Int
-  , metaMaxPrefixLength :: Int
-  , metaTotalAddrs :: Int
-  }
-
 optparser :: Parser Config
 optparser = Config
   <$> strOption ( long "input"
@@ -89,14 +75,7 @@ optparser = Config
                 )
   <*> strOption ( long "output"
                   <> metavar "FILEPATH_PREFIX"
-                  <> help "Prefix for output files, or - for stdout."
-                )
-  <*> option (eitherReader parseOutputFormat)
-        ( long "format"
-          <> metavar "FORMAT"
-          <> value OutputCsv
-          <> showDefaultWith formatName
-          <> help "Output format: csv or json."
+                  <> help "Prefix for output files."
                 )
   <*> switch ( long "structure" <> short 't'
                <> help "Compute structure function (OUT_PREFIX_structure.csv)."
@@ -135,33 +114,10 @@ main :: IO ()
 main = do
   conf <- execParser opts
   if not (cfgStructure conf) && not (cfgSpectrum conf) && not (cfgDimensions conf)
-    then dieWith "Must specify one of --structure, --spectrum, or --dimensions to compute."
+    then putStrLn "Must specify one of --structure, --spectrum, or --dimensions to compute."
     else if (isJust (cfgAddrCol conf) || isJust (cfgMeasureCol conf)) && not (cfgCsv conf)
-    then dieWith "To specify --addr-col or --meas-col, you must also indicate the input is a csv file by specifying --csv"
-    else if cfgOutPrefix conf == "-" && cfgFormat conf == OutputCsv && requestedAnalysisCount conf > 1
-    then dieWith "CSV stdout only supports a single requested analysis; use --format json or a file prefix."
+    then putStrLn "To specify --addr-col or --meas-col, you must also indicate the input is a csv file by specifying --csv"
     else run conf
-
-parseOutputFormat :: String -> Either String OutputFormat
-parseOutputFormat "csv" = Right OutputCsv
-parseOutputFormat "json" = Right OutputJson
-parseOutputFormat _ = Left "FORMAT must be one of: csv, json"
-
-formatName :: OutputFormat -> String
-formatName OutputCsv = "csv"
-formatName OutputJson = "json"
-
-dieWith :: String -> IO ()
-dieWith msg = hPutStrLn stderr msg >> exitFailure
-
-requestedAnalysisCount :: Config -> Int
-requestedAnalysisCount conf =
-  length $
-    filter id
-      [ cfgStructure conf
-      , cfgSpectrum conf
-      , cfgDimensions conf
-      ]
 
 {-
  - Run analysis and write results as described by the given configuration.
@@ -178,20 +134,14 @@ run conf = do
                      Just col -> read . B.unpack . flip (!!) col
                      Nothing -> const 1.0 -- default to constant 1.0 for each address
              in PM.fromFile (cfgFilepath conf) (cfgSkipFirst conf) extract_addr extract_meas
-        else PM.fromFile (cfgFilepath conf) (cfgSkipFirst conf) extractSingleAddr (const 1.0)
+        else PM.fromFile (cfgFilepath conf) (cfgSkipFirst conf) head (const 1.0)
 
   let !firstAtomicLength = PM.firstAtomicLength pfxs
   let !firstSpilloverLength = PM.firstSpilloverLength (cfgSpilloverThresh conf) pfxs
 
-  hPutStrLn stderr $ "First atomic length: " ++ show firstAtomicLength
-  hPutStrLn stderr $ "First spill-over length: " ++ show firstSpilloverLength
+  putStrLn $ "First atomic length: " ++ show firstAtomicLength
+  putStrLn $ "First spill-over length: " ++ show firstSpilloverLength
   let conf' = conf { cfgPrefixLengths = [firstAtomicLength .. firstSpilloverLength] }
-      metadata = Metadata
-        { metaInput = cfgFilepath conf
-        , metaMinPrefixLength = foldl1 min (cfgPrefixLengths conf')
-        , metaMaxPrefixLength = foldl1 max (cfgPrefixLengths conf')
-        , metaTotalAddrs = length (PM.leaves pfxs)
-        }
 
   -- Compute the structure function
   let oneTau q = 
@@ -209,72 +159,48 @@ run conf = do
 
       taus = qs & VU.fromList & VU.map oneTau
 
-      structureRows = if cfgStructure conf' then Just (VU.toList taus) else Nothing
-      spectrumRows = if cfgSpectrum conf' then Just (computeSpectrumRows taus) else Nothing
-      dimensionRows = if cfgDimensions conf' then Just (computeDimensionRows conf' taus pfxs) else Nothing
+  -- Write metadata
+  writeMetadata conf' pfxs
+  
+  -- Write the structure function if requested
+  when (cfgStructure conf') (runStructure conf' taus)
 
-  emitResults conf' metadata structureRows spectrumRows dimensionRows
+  -- Compute and write the multifractal spectrum if requested
+  when (cfgSpectrum conf') (runSpectrum conf' taus)
 
-{-
- - Emit results in the requested output format.
- -}
-emitResults :: Config -> Metadata -> Maybe [(Double, Double, Double)] -> Maybe [(Double, Double)] -> Maybe [(Double, Double)] -> IO ()
-emitResults conf metadata structureRows spectrumRows dimensionRows =
-  case cfgFormat conf of
-    OutputCsv -> emitCsvResults conf metadata structureRows spectrumRows dimensionRows
-    OutputJson -> emitJsonResults conf metadata structureRows spectrumRows dimensionRows
+  -- Compute and write the generalized dimensions if requested
+  when (cfgDimensions conf') (runDimensions conf' taus pfxs)
 
 {-
- - Write metadata to csv file.
+ - Write some metadata to keep track of config and parameters that were auto-generated here
  -}
-writeMetadata :: Config -> Metadata -> IO ()
-writeMetadata conf metadata = do
+writeMetadata :: Config -> PrefixMap Double -> IO ()
+writeMetadata conf pfxs = do
   let outfile = cfgOutPrefix conf ++ "_metadata.csv"
-  hPutStrLn stderr $ "Writing metadata to " ++ outfile
+  putStrLn $ "Writing metadata to " ++ outfile
   withFile outfile WriteMode $ \hdl -> do
     hPutStrLn hdl "key,value"
-    hPutStrLn hdl $ "input," ++ metaInput metadata
-    hPutStrLn hdl $ "min_prefix_length," ++ show (metaMinPrefixLength metadata)
-    hPutStrLn hdl $ "max_prefix_length," ++ show (metaMaxPrefixLength metadata)
-    hPutStrLn hdl $ "total_addrs," ++ show (metaTotalAddrs metadata)
+    hPutStrLn hdl $ "input," ++ cfgFilepath conf
+    hPutStrLn hdl $ "min_prefix_length," ++ show (foldl1 min (cfgPrefixLengths conf))
+    hPutStrLn hdl $ "max_prefix_length," ++ show (foldl1 max (cfgPrefixLengths conf))
+    hPutStrLn hdl $ "total_addrs," ++ show (length (PM.leaves pfxs))
 
 {-
- - Emit csv results to stdout or files.
+ - Write the structure function
  -}
-emitCsvResults :: Config -> Metadata -> Maybe [(Double, Double, Double)] -> Maybe [(Double, Double)] -> Maybe [(Double, Double)] -> IO ()
-emitCsvResults conf metadata structureRows spectrumRows dimensionRows =
-  if cfgOutPrefix conf == "-"
-  then
-    case () of
-      _ | cfgStructure conf -> maybe (return ()) (writeStructureCsv stdout) structureRows
-        | cfgSpectrum conf -> maybe (return ()) (writeSpectrumCsv stdout) spectrumRows
-        | otherwise -> maybe (return ()) (writeDimensionsCsv stdout) dimensionRows
-  else do
-    writeMetadata conf metadata
-    maybe (return ()) (writeStructureFile conf) structureRows
-    maybe (return ()) (writeSpectrumFile conf) spectrumRows
-    maybe (return ()) (writeDimensionsFile conf) dimensionRows
-
-{-
- - Write structure rows to csv file.
- -}
-writeStructureFile :: Config -> [(Double, Double, Double)] -> IO ()
-writeStructureFile conf rows = do
+runStructure :: Config -> VU.Vector (Double, Double, Double) -> IO ()
+runStructure conf taus = do
   let outfile = cfgOutPrefix conf ++ "_structure.csv"
-  hPutStrLn stderr $ "Writing structure function to " ++ outfile
-  withFile outfile WriteMode (\hdl -> writeStructureCsv hdl rows)
-
-writeStructureCsv :: Handle -> [(Double, Double, Double)] -> IO ()
-writeStructureCsv hdl rows = do
-  hPutStrLn hdl "q,tauTilde,sd"
-  forM_ rows $ \(q, tauTilde, sd) ->
-    hPutStrLn hdl (show q ++ "," ++ show tauTilde ++ "," ++ show sd)
+  putStrLn $ "Writing structure function to " ++ outfile
+  withFile outfile WriteMode $ \hdl -> do
+    hPutStrLn hdl "q,tauTilde,sd"
+    VU.forM_ taus $ \(q, tauTilde, sd) -> hPutStrLn hdl (show q ++ "," ++ show tauTilde ++ "," ++ show sd)
 
 {-
- - Compute multifractal spectrum rows.
+ - Compute and write multifractal spectrum
  -}
-computeSpectrumRows :: VU.Vector (Double, Double, Double) -> [(Double, Double)]
-computeSpectrumRows taus =
+runSpectrum :: Config -> VU.Vector (Double, Double, Double) -> IO ()
+runSpectrum conf taus = do
   -- Estimate alpha and f(alpha) for each q
   let alphas = [1..VU.length taus - 2]
         & fmap (\i ->
@@ -288,143 +214,39 @@ computeSpectrumRows taus =
 
       -- Filter for range where alpha is monotonic decreasing
       -- Note this always skips the first alpha. Should be ok if we have enough alpha samples...
-      diffs = zip alphas (drop 1 alphas)
+      diffs = zip alphas (tail alphas)
         & fmap (\((a1, _), (a2, f2)) -> (a1 > a2, (a2, f2)))
         & dropWhile (not . fst) -- assume it only turns around once at beginning and once at end...
         & takeWhile fst
         & fmap snd
-  in diffs
 
-{-
- - Write spectrum rows to csv file.
- -}
-writeSpectrumFile :: Config -> [(Double, Double)] -> IO ()
-writeSpectrumFile conf rows = do
+  -- Write to file
   let outfile = cfgOutPrefix conf ++ "_spectrum.csv"
-  hPutStrLn stderr $ "Writing multifractal spectrum to " ++ outfile
-  withFile outfile WriteMode (\hdl -> writeSpectrumCsv hdl rows)
-
-writeSpectrumCsv :: Handle -> [(Double, Double)] -> IO ()
-writeSpectrumCsv hdl rows = do
-  hPutStrLn hdl "alpha,f"
-  forM_ rows $ \(alpha, f) ->
-    hPutStrLn hdl (show alpha ++ "," ++ show f)
+  putStrLn $ "Writing multifractal spectrum to " ++ outfile
+  withFile outfile WriteMode $ \hdl -> do
+    hPutStrLn hdl "alpha,f"
+    forM_ diffs $ \(alpha, f) -> do
+      hPutStrLn hdl (show alpha ++ "," ++ show f)
 
 {-
- - Compute generalized dimension rows.
+ - Compute and write generalized dimensions
  -}
-computeDimensionRows :: Config -> VU.Vector (Double, Double, Double) -> PrefixMap Double -> [(Double, Double)]
-computeDimensionRows conf taus pfxs =
+runDimensions :: Config -> VU.Vector (Double, Double, Double) -> PrefixMap Double -> IO ()
+runDimensions conf taus pfxs = do
   let d1 = infoDim conf pfxs
-      otherDims = taus
-        & VU.toList
-        & filter (\(q, _, _) -> q == 0.0 || q == 2.0)
-        & fmap (\(q, tauTilde, _) -> (q, tauTilde / (q - 1.0)))
-  in (1.0, d1) : otherDims
 
-{-
- - Write dimension rows to csv file.
- -}
-writeDimensionsFile :: Config -> [(Double, Double)] -> IO ()
-writeDimensionsFile conf rows = do
+  -- Write to file
   let outfile = cfgOutPrefix conf ++ "_dimensions.csv"
-  hPutStrLn stderr $ "Writing generalized dimensions to " ++ outfile
-  withFile outfile WriteMode (\hdl -> writeDimensionsCsv hdl rows)
-
-writeDimensionsCsv :: Handle -> [(Double, Double)] -> IO ()
-writeDimensionsCsv hdl rows = do
-  hPutStrLn hdl "q,dim"
-  forM_ rows $ \(q, dim) ->
-    hPutStrLn hdl (show q ++ "," ++ show dim)
-
-{-
- - Emit json results to stdout or file.
- -}
-emitJsonResults :: Config -> Metadata -> Maybe [(Double, Double, Double)] -> Maybe [(Double, Double)] -> Maybe [(Double, Double)] -> IO ()
-emitJsonResults conf metadata structureRows spectrumRows dimensionRows = do
-  let payload = encodeResultsJson metadata structureRows spectrumRows dimensionRows
-  if cfgOutPrefix conf == "-"
-  then putStrLn payload
-  else do
-    let outfile = cfgOutPrefix conf ++ ".json"
-    hPutStrLn stderr $ "Writing json results to " ++ outfile
-    writeFile outfile (payload ++ "\n")
-
-encodeResultsJson :: Metadata -> Maybe [(Double, Double, Double)] -> Maybe [(Double, Double)] -> Maybe [(Double, Double)] -> String
-encodeResultsJson metadata structureRows spectrumRows dimensionRows =
-  jsonObject $
-    [ ("schemaVersion", "1")
-    , ("metadata", encodeMetadataJson metadata)
-    ]
-    ++ maybe [] (\rows -> [("structure", encodeStructureRowsJson rows)]) structureRows
-    ++ maybe [] (\rows -> [("spectrum", encodeSpectrumRowsJson rows)]) spectrumRows
-    ++ maybe [] (\rows -> [("dimensions", encodeDimensionRowsJson rows)]) dimensionRows
-
-encodeMetadataJson :: Metadata -> String
-encodeMetadataJson metadata =
-  jsonObject
-    [ ("input", jsonString (metaInput metadata))
-    , ("minPrefixLength", show (metaMinPrefixLength metadata))
-    , ("maxPrefixLength", show (metaMaxPrefixLength metadata))
-    , ("totalAddrs", show (metaTotalAddrs metadata))
-    ]
-
-encodeStructureRowsJson :: [(Double, Double, Double)] -> String
-encodeStructureRowsJson rows =
-  jsonArray $
-    fmap (\(q, tauTilde, sd) ->
-            jsonObject
-              [ ("q", show q)
-              , ("tauTilde", show tauTilde)
-              , ("sd", show sd)
-              ]
-         ) rows
-
-encodeSpectrumRowsJson :: [(Double, Double)] -> String
-encodeSpectrumRowsJson rows =
-  jsonArray $
-    fmap (\(alpha, f) ->
-            jsonObject
-              [ ("alpha", show alpha)
-              , ("f", show f)
-              ]
-         ) rows
-
-encodeDimensionRowsJson :: [(Double, Double)] -> String
-encodeDimensionRowsJson rows =
-  jsonArray $
-    fmap (\(q, dim) ->
-            jsonObject
-              [ ("q", show q)
-              , ("dim", show dim)
-              ]
-         ) rows
-
-jsonObject :: [(String, String)] -> String
-jsonObject fields =
-  "{"
-    ++ L.intercalate "," (fmap (\(k, v) -> jsonString k ++ ":" ++ v) fields)
-    ++ "}"
-
-jsonArray :: [String] -> String
-jsonArray values = "[" ++ L.intercalate "," values ++ "]"
-
-jsonString :: String -> String
-jsonString str = "\"" ++ concatMap escapeJson str ++ "\""
-
-escapeJson :: Char -> String
-escapeJson '"' = "\\\""
-escapeJson '\\' = "\\\\"
-escapeJson '\b' = "\\b"
-escapeJson '\f' = "\\f"
-escapeJson '\n' = "\\n"
-escapeJson '\r' = "\\r"
-escapeJson '\t' = "\\t"
-escapeJson c = [c]
-
-extractSingleAddr :: [ByteString] -> ByteString
-extractSingleAddr (addr:_) = addr
-extractSingleAddr [] = error "Expected at least one column in each input row"
+  putStrLn $ "Writing generalized dimensions to " ++ outfile
+  withFile outfile WriteMode $ \hdl -> do
+    hPutStrLn hdl "q,dim"
+    hPutStrLn hdl ("1.0," ++ show d1)
+    taus
+      & VU.filter (\(q, _, _) -> q == 0.0 || q == 2.0)
+      & VU.mapM_ (\(q, tauTilde, sd) -> do
+                     let dq = tauTilde / (q - 1.0)
+                     hPutStrLn hdl (show q ++ "," ++ show dq)
+                 )
 
 infoDim :: Config -> PrefixMap Double -> Double
 infoDim conf pfxs =
