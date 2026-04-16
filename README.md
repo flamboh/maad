@@ -22,15 +22,16 @@ $ ./MAAD  --help
 MAAD - Multifractal Address-space Anomaly Detection
 
 Usage: MAAD --input FILEPATH --output FILEPATH_PREFIX [-t|--structure]
-            [-s|--spectrum] [-d|--dimensions] [--csv] [-a|--addr-col COL]
-            [-m|--meas-col COL] [--skip-first]
+            [--format FORMAT] [-s|--spectrum] [-d|--dimensions] [--csv]
+            [-a|--addr-col COL] [-m|--meas-col COL] [--skip-first]
 
   Compute a combination of different multifractal analyses of a given set of IP
   addresses, optimally based on a per-address measure.
 
 Available options:
   --input FILEPATH         File to read (csv or one address on each line).
-  --output FILEPATH_PREFIX Prefix for output files.
+  --output FILEPATH_PREFIX Prefix for output files, or "-" for stdout.
+  --format FORMAT          Output format: csv or json. Default: csv
   -t,--structure           Compute structure function
                            (OUT_PREFIX_structure.csv).
   -s,--spectrum            Compute multifractal spectrum
@@ -48,7 +49,17 @@ Available options:
   -h,--help                Show this help text
 ```
 
-To read from stdin, use "-" as input filepath.
+To read from stdin, use `--input -`.
+
+To write a single csv analysis to stdout, use `--output - --format csv`.
+
+To write combined machine-readable output for multiple analyses to stdout, use
+`--output - --format json`.
+
+Example:
+```
+$ ./MAAD --input - --output - --format json --structure --spectrum --dimensions < test_data/simple.csv
+```
 
 A couple example input files with lists of IPv4 addresses are included in `./test_data/` for testing.
 
@@ -97,4 +108,3 @@ For example, if you've saved the spectrum function in `spec.csv`, you could gene
 ```
 $ ./plots/plot.sh plots/spectrum.gnuplot spec.csv spec.svg
 ```
-
