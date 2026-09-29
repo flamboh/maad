@@ -1142,7 +1142,11 @@ encodeMetadataJson metadata =
     , "totalAddrs" .= metaTotalAddrs metadata
     , "didAutoStop" .= metaDidAutoStop metadata
     , "prefix_counts" .= encodePrefixCountsJson (metaPrefixCounts metadata)
-    -- TODO: add pre-filter prefix counts, multinomial fits and per-prefix-length variances!!!
+    , "pre_filter_prefix_counts" .= encodePrefixCountsJson (metaPreFilterPrefixCounts metadata)
+    , "multinomial_fits" .= encodeMultinomialFits (fmap fst (metaPrefixCounts metadata) `zip` metaMultinomialFits metadata)
+    , "per_prefix_length_vars" .= encodePerPrefixLengthVarsJson (metaPerPrefixLengthVars metadata)
+    , "qMax" .= fst (metaCriticalRegion metadata)
+    , "qMin" .= snd (metaCriticalRegion metadata)
     ]
 
 encodePrefixCountsJson :: [(Int, Int)] -> [Value]
@@ -1156,17 +1160,31 @@ encodePrefixCountsJson counts =
     )
     counts
 
-encodeMultinomialFits :: [(Double, Double, Double)] -> [Value]
+encodeMultinomialFits :: [(Int, (Double, Double, Double))] -> [Value]
 encodeMultinomialFits fits =
   fmap
-    (\(maxP, maxB, lower_limit) ->
+    (\(pl, (maxP, maxB, lower_limit)) ->
        object
-         [ "maxP" .= maxP
+         [ "pl" .= pl
+         , "maxP" .= maxP
          , "maxB" .= maxB
          , "lower_limit" .= lower_limit
          ]
     )
     fits
+
+encodePerPrefixLengthVarsJson :: [(Int, Double, Double, Double)] -> [Value]
+encodePerPrefixLengthVarsJson vars =
+  fmap
+    (\(pl, q, tau, v) ->
+       object
+         [ "pl" .= pl
+         , "q" .= q
+         , "tau" .= tau
+         , "var" .= v
+         ]
+    )
+    vars
 
 encodeStructureRowsJson :: [(Double, Double, Double)] -> [Value]
 encodeStructureRowsJson rows =
